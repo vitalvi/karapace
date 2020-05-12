@@ -91,6 +91,78 @@ async def enum_schema_compatibility_checks(c, compatibility):
     assert res["fields"][0]["type"]["symbols"] == ["second"]
 
 
+async def record_union_schema_compatibility_checks(c):
+    subject = os.urandom(16).hex()
+    res = await c.put(f"config/{subject}", json={"compatibility": "BACKWARD"})
+    assert res.status == 200
+    original_schema = {
+        "name": "bar",
+        "namespace": "foo",
+        "type": "record",
+        "fields": [{
+            "name": "foobar",
+            "type": [{
+                "type": "array",
+                "name": "foobar_items",
+                "items": {
+                    "type": "record",
+                    "name": "foobar_fields",
+                    "fields": [{
+                        "name": "foo",
+                        "type": "string"
+                    }]
+                }
+            }]
+        }]
+    }
+    res = await c.post(f"subjects/{subject}/versions", json={"schema": jsonlib.dumps(original_schema)})
+    assert res.status == 200
+    assert "id" in res.json()
+
+    evolved_schema = {
+        "name": "bar",
+        "namespace": "foo",
+        "type": "record",
+        "fields": [{
+            "name": "foobar",
+            "type": [{
+                "type": "array",
+                "name": "foobar_items",
+                "items": {
+                    "type": "record",
+                    "name": "foobar_fields",
+                    "fields": [{
+                        "name": "foo",
+                        "type": "string"
+                    }, {
+                        "name": "bar",
+                        "type": ["null", "string"],
+                        "default": None
+                    }]
+                }
+            }]
+        }]
+    }
+    res = await c.post(
+        f"compatibility/subjects/{subject}/versions/latest",
+        json={"schema": jsonlib.dumps(evolved_schema)},
+    )
+    assert res.status == 200
+    res = await c.post(f"subjects/{subject}/versions", json={"schema": jsonlib.dumps(evolved_schema)})
+    assert res.status == 200
+    assert "id" in res.json()
+
+    # Check that we can delete the field as well
+    res = await c.post(
+        f"compatibility/subjects/{subject}/versions/latest",
+        json={"schema": jsonlib.dumps(original_schema)},
+    )
+    assert res.status == 200
+    res = await c.post(f"subjects/{subject}/versions", json={"schema": jsonlib.dumps(original_schema)})
+    assert res.status == 200
+    assert "id" in res.json()
+
+
 async def record_nested_schema_compatibility_checks(c):
     subject = os.urandom(16).hex()
 
@@ -445,6 +517,101 @@ async def record_schema_compatibility_checks(c):
         json={"schema": jsonlib.dumps(schema5)},
     )
     assert res.status == 409
+
+    subject = os.urandom(16).hex()
+    res = await c.put(f"config/{subject}", json={"compatibility": "BACKWARD"})
+    schema = {
+        "type": "record",
+        "name": "Object",
+        "fields": [
+            {
+                "name": "first_name",
+                "type": "string"
+            }
+        ]
+    }
+    res = await c.post(
+        f"subjects/{subject}/versions",
+        json={"schema": jsonlib.dumps(schema)}
+    )
+    assert res.status == 200
+    schema["fields"].append({"name": "last_name", "type": "string"})
+    res = await c.post(
+        f"subjects/{subject}/versions",
+        json={"schema": jsonlib.dumps(schema)}
+    )
+    assert res.status == 409
+
+
+async def check_enum_schema_field_add_compatibility(c):
+    expected_results = [
+        ("BACKWARD", 200),
+        ("FORWARD", 200),
+        ("FULL", 200)
+    ]
+    for compatibility, status_code in expected_results:
+        subject = os.urandom(16).hex()
+        res = await c.put(f"config/{subject}", json={"compatibility": compatibility})
+        assert res.status == 200
+        schema = {
+            "type": "enum",
+            "name": "Suit",
+            "symbols" : ["SPADES", "HEARTS", "DIAMONDS"]
+        }
+        res = await c.post(
+            f"subjects/{subject}/versions",
+            json={"schema": jsonlib.dumps(schema)}
+        )
+        assert res.status == 200
+
+        # Add a field
+        schema["symbols"].append("CLUBS")
+        res = await c.post(
+            f"subjects/{subject}/versions",
+            json={"schema": jsonlib.dumps(schema)}
+        )
+        assert res.status == status_code
+
+
+async def check_array_schema_field_add_compatibility(c):
+    expected_results = [
+        ("BACKWARD", 200),
+        ("FORWARD", 409),
+        ("FULL", 409)
+    ]
+    for compatibility, status_code in expected_results:
+        subject = os.urandom(16).hex()
+        res = await c.put(f"config/{subject}", json={"compatibility": compatibility})
+        assert res.status == 200
+        schema = {
+            "type": "array",
+            "items": "int"
+        }
+        res = await c.post(
+            f"subjects/{subject}/versions",
+            json={"schema": jsonlib.dumps(schema)}
+        )
+        assert res.status == 200
+
+        # Modify the items type
+        schema["items"] = "long"
+        res = await c.post(
+            f"subjects/{subject}/versions",
+            json={"schema": jsonlib.dumps(schema)}
+        )
+        assert res.status == status_code
+
+
+async def chcek_map_schema(c):
+    expected_result = [
+        ("BACKWARD", 200),
+        ("FORWARD", 200),
+        ("FULL", 200)
+    ]
+    for compatibility, status_code in expected_result:
+        subject = os.urandom(16).hex()
+        res = await c.put(f"config/{subject}", json={"compatibility": compatibility})
+        assert res.status == 200
 
 
 async def check_transitive_compatibility(c):
@@ -1107,8 +1274,11 @@ async def run_schema_tests(c):
     await compatibility_endpoint_checks(c)
     await record_schema_compatibility_checks(c)
     await record_nested_schema_compatibility_checks(c)
+    await record_union_schema_compatibility_checks(c)
     for compatibility in {"FORWARD", "BACKWARD", "FULL"}:
         await enum_schema_compatibility_checks(c, compatibility)
+    await check_enum_schema_field_add_compatibility(c)
+    await check_array_schema_field_add_compatibility(c)
     await config_checks(c)
     await check_transitive_compatibility(c)
     await check_http_headers(c)

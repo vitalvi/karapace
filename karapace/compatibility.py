@@ -7,7 +7,6 @@ See LICENSE for details
 import avro.schema
 import logging
 
-
 class IncompatibleSchema(Exception):
     pass
 
@@ -92,6 +91,7 @@ class Compatibility:
 
     _NUMBER_TYPES = {"int", "long", "float", "double"}
     _STRING_TYPES = {"string", "bytes"}
+    _PRIMITIVE_TYPES = set(list(_NUMBER_TYPES) + list(_STRING_TYPES))  # TODO: Fix
 
     def __init__(self, source, target, compatibility):
         self.source = source
@@ -135,6 +135,10 @@ class Compatibility:
             return isinstance(target.type, avro.schema.RecordSchema), False
         if isinstance(source.type, avro.schema.EnumSchema):
             return isinstance(target.type, avro.schema.EnumSchema), True
+        if isinstance(source.type, avro.schema.ArraySchema):
+            return isinstance(target.type, avro.schema.ArraySchema), False
+        if isinstance(source.type, avro.schema.UnionSchema):
+            return isinstance(target.type, avro.schema.UnionSchema), False
         raise IncompatibleSchema("Unhandled schema type: {}".format(type(source.type)))
 
     def check_type_promotion(self, source_type, target_type):
@@ -144,6 +148,58 @@ class Compatibility:
             return self._TYPE_PROMOTION_RULES[self._checking_for][source_type.type][target_type.type]
         except KeyError:
             return False
+
+    # TODO: Refactor to not duplicate logic
+    def check_source_item(self, source, target):
+        if source.items.type in self._PRIMITIVE_TYPES:
+            if not self.check_type_promotion(source.items, target.items):
+                raise IncompatibleSchema(
+                    "Incompatible type promotion {} {}".format(source.items.type, target.items.type)
+                )
+            return
+
+        same_type, base_type = self.check_same_type(source, target)
+        if not same_type:
+            raise IncompatibleSchema(
+                "source.item: {} != target.item: {}".format(source.items.type, target.items.type)
+            )
+        if not base_type:
+            self.check_compatibility(source.items, target.items)
+        else:
+            if not self.check_type_promotion(source.items, target.items):
+                raise IncompatibleSchema(
+                    "Incompatible type promotion {} {}".format(source.items.type, target.items.type)
+                    )
+            return
+
+        if self._checking_for in {"FORWARD", "FULL"} and not source.items.has_default:
+            raise IncompatibleSchema("Source field: {} removed".format(source.items.name))
+
+    # TODO: Refactor to not duplicate logic
+    def check_target_item(self, source, target):
+        if target.items.type in self._PRIMITIVE_TYPES:
+            if not self.check_type_promotion(source.items, target.items):
+                raise IncompatibleSchema(
+                    "Incompatible type promotion {} {}".format(source.items.type, target.items.type)
+                )
+            return
+
+        same_type, base_type = self.check_same_type(source.items, target.items)
+        if not same_type:
+            raise IncompatibleSchema(
+                "source.item: {} != target.item: {}".format(source.items, target.items)
+            )
+        if not base_type:
+            self.check_compatibility(source.items, target.items)
+        else:
+            if not self.check_type_promotion(source.items, target.items):
+                raise IncompatibleSchema(
+                    "Incompatible type promotion {} {}".format(source.items.type, target.items.type)
+                    )
+            return
+
+        if self._checking_for in {"BACKWARD", "FULL"} and not target.items.has_default:
+            raise IncompatibleSchema("Target field: {} added".format(target.items.name))
 
     def check_source_field(self, source, target):
         for source_field in source.fields:
@@ -208,3 +264,14 @@ class Compatibility:
         if source.type == "record":
             self.check_source_field(source, target)
             self.check_target_field(source, target)
+        elif source.type == "array":
+            self.check_source_item(source, target)
+            self.check_target_item(source, target)
+        elif source.type == "map":
+            pass
+        elif source.type == "union" and target.type == "union":  # TODO: Check if handling here is actually needed
+            pass
+        elif source.type == "union" and target.type != "union":
+            pass
+        elif source.type != "union" and target.type == "union":
+            pass
