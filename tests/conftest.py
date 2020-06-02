@@ -185,8 +185,7 @@ async def fixture_rest_async(session_tmpdir, kafka_server, registry_async_client
         try:
             yield rest
         finally:
-            rest.close()
-            await rest.close_producers()
+            await rest.close()
 
 
 @pytest.fixture(scope="function", name="rest_async_client")

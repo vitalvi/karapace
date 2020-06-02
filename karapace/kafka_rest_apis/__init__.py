@@ -50,7 +50,7 @@ class KafkaRest(KarapaceBase):
         self.admin_lock = Lock()
         self.metadata_cache = None
         self.schemas_cache = {}
-        self.consumer_manager = ConsumerManager(config_path)
+        self.consumer_manager = ConsumerManager(config_path, loop=self.loop)
         self.init_admin_client()
         self.producer_refs = []
         self.producer_queue = asyncio.Queue()
@@ -307,14 +307,15 @@ class KafkaRest(KarapaceBase):
         self.producer_queue = None
         return
 
-    def close(self):
+    async def close(self):
         super().close()
         if self.admin_client:
             self.admin_client.close()
             self.admin_client = None
         if self.consumer_manager:
-            self.consumer_manager.close()
+            await self.consumer_manager.close()
             self.consumer_manager = None
+        await self.close_producers()
 
     async def publish(self, topic: str, partition_id: Optional[str], content_type: str, formats: dict, data: dict):
         _ = self.get_topic_info(topic, content_type)

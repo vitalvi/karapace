@@ -1,9 +1,10 @@
-from asyncio import Lock
+from aiokafka import AIOKafkaConsumer
+from asyncio import AbstractEventLoop, Lock
 from collections import defaultdict, namedtuple
 from functools import partial
-from kafka import KafkaConsumer
 from kafka.errors import IllegalStateError, KafkaConfigurationError, KafkaError
 from kafka.structs import OffsetAndMetadata, TopicPartition
+from karapace.config import create_ssl_context
 from karapace.karapace import empty_response, KarapaceBase
 from karapace.serialization import InvalidMessageHeader, InvalidPayload, SchemaRegistryDeserializer
 from karapace.utils import convert_to_int
@@ -25,7 +26,8 @@ TypedConsumer = namedtuple("TypedConsumer", ["consumer", "serialization_format",
 
 
 class ConsumerManager:
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, loop: AbstractEventLoop = None):
+        self.loop = loop or asyncio.get_running_loop()
         self.config = KarapaceBase.read_config(config_path)
         self.hostname = f"http://{self.config['advertised_hostname']}:{self.config['port']}"
         self.log = logging.getLogger("RestConsumerManager")
@@ -112,15 +114,13 @@ class ConsumerManager:
         return ConsumerManager._assert(cond=False, code=409, sub_code=40903, content_type=content_type, message=message)
 
     @staticmethod
-    def _update_partition_assignments(consumer: KafkaConsumer):
+    async def _update_partition_assignments(consumer: AIOKafkaConsumer):
         # This is (should be?) equivalent to calling poll on the consumer.
         # which would return 0 results, since the subscription we just created will mean
         # a rejoin is needed, which skips the actual fetching. Nevertheless, an actual call to poll is to be avoided
         # and a better solution to this is desired (extend the consumer??)
         # pylint: disable=W0212
-        consumer._coordinator.poll()
-        if not consumer._subscription.has_all_fetch_positions():
-            consumer._update_fetch_positions(consumer._subscription.missing_fetch_positions())
+        await consumer.getmany(timeout_ms=0)
 
     # external api below
     # CONSUMER
@@ -148,12 +148,10 @@ class ConsumerManager:
                 convert_to_int(request_data, k, content_type)
             try:
 
-                request_data["consumer.request.timeout.ms"] = request_data.get(
-                    "consumer.request.timeout.ms", KafkaConsumer.DEFAULT_CONFIG["request_timeout_ms"]
-                )
+                request_data["consumer.request.timeout.ms"] = request_data.get("consumer.request.timeout.ms", 40 * 1000)
                 request_data["auto.commit.enable"] = request_data.get("auto.commit.enable", "false") == "true"
                 request_data["auto.offset.reset"] = request_data.get("auto.offset.reset", "earliest")
-                fetch_min_bytes = request_data.get("fetch.min.bytes", KafkaConsumer.DEFAULT_CONFIG["fetch_min_bytes"])
+                fetch_min_bytes = request_data.get("fetch.min.bytes", 1)
                 c = await self.create_kafka_consumer(fetch_min_bytes, group_name, internal_name, request_data)
             except KafkaConfigurationError as e:
                 KarapaceBase.internal_error(str(e), content_type)
@@ -166,19 +164,19 @@ class ConsumerManager:
     async def create_kafka_consumer(self, fetch_min_bytes, group_name, internal_name, request_data):
         while True:
             try:
-                c = KafkaConsumer(
+                c = AIOKafkaConsumer(
+                    loop=self.loop,
                     bootstrap_servers=self.config["bootstrap_uri"],
                     client_id=internal_name,
                     security_protocol=self.config["security_protocol"],
-                    ssl_cafile=self.config["ssl_cafile"],
-                    ssl_certfile=self.config["ssl_certfile"],
-                    ssl_keyfile=self.config["ssl_keyfile"],
+                    ssl_context=None if self.config["security_protocol"] != "SSL" else create_ssl_context(self.config),
                     group_id=group_name,
                     fetch_min_bytes=fetch_min_bytes,
                     request_timeout_ms=request_data["consumer.request.timeout.ms"],
                     enable_auto_commit=request_data["auto.commit.enable"],
                     auto_offset_reset=request_data["auto.offset.reset"]
                 )
+                await c.start()
                 return c
             except:  # pylint: disable=bare-except
                 self.log.exception("Unable to create consumer, retrying")
@@ -212,13 +210,13 @@ class ConsumerManager:
             # If we commit for a partition that does not belong to this consumer, then the internal error raised
             # is marked as retriable, and thus the commit method will remain blocked in what looks like an infinite loop
             self._topic_and_partition_valid(cluster_metadata, el, content_type)
-            payload[TopicPartition(el["topic"], el["partition"])] = OffsetAndMetadata(el["offset"] + 1, None)
+            payload[TopicPartition(el["topic"], el["partition"])] = OffsetAndMetadata(offset=el["offset"] + 1, metadata="")
 
         async with self.consumer_locks[internal_name]:
             consumer = self.consumers[internal_name].consumer
             payload = payload or None
             try:
-                consumer.commit(offsets=payload)
+                await consumer.commit(offsets=payload)
             except KafkaError as e:
                 KarapaceBase.internal_error(message=f"error sending commit request: {e}", content_type=content_type)
         empty_response()
@@ -233,14 +231,14 @@ class ConsumerManager:
             for el in request_data["partitions"]:
                 convert_to_int(el, "partition", content_type)
                 tp = TopicPartition(el["topic"], el["partition"])
-                commit_info = consumer.committed(tp, metadata=True)
+                commit_info = await consumer.committed(tp)
                 if not commit_info:
                     continue
                 response["offsets"].append({
                     "topic": tp.topic,
                     "partition": tp.partition,
-                    "metadata": commit_info.metadata,
-                    "offset": commit_info.offset
+                    "metadata": None,
+                    "offset": commit_info
                 })
         KarapaceBase.r(body=response, content_type=content_type)
 
@@ -254,13 +252,13 @@ class ConsumerManager:
             consumer = self.consumers[internal_name].consumer
             try:
                 consumer.subscribe(topics=topics, pattern=topics_pattern)
-                self._update_partition_assignments(consumer)
+                await self._update_partition_assignments(consumer)
                 empty_response()
             except AssertionError:
                 self._illegal_state_fail(
                     message="Neither topic_pattern nor topics are present in request", content_type=content_type
                 )
-            except IllegalStateError as e:
+            except (IllegalStateError, ValueError) as e:
                 self._illegal_state_fail(str(e), content_type=content_type)
             finally:
                 self.log.info("Done updating subscription")
@@ -297,7 +295,7 @@ class ConsumerManager:
             try:
                 consumer = self.consumers[internal_name].consumer
                 consumer.assign(partitions)
-                self._update_partition_assignments(consumer)
+                await self._update_partition_assignments(consumer)
                 empty_response()
             except IllegalStateError as e:
                 self._illegal_state_fail(message=str(e), content_type=content_type)
@@ -335,8 +333,8 @@ class ConsumerManager:
             for part, offset in seeks:
                 try:
                     consumer.seek(part, offset)
-                except AssertionError:
-                    self._illegal_state_fail(f"Partition {part} is unassigned", content_type)
+                except (AssertionError, ValueError, IllegalStateError) as e:
+                    self._illegal_state_fail(f"Error seeking for {part} : {e}", content_type)
             empty_response()
 
     async def seek_limit(
@@ -357,12 +355,12 @@ class ConsumerManager:
             consumer = self.consumers[internal_name].consumer
             try:
                 if beginning:
-                    consumer.seek_to_beginning(*resets)
+                    await consumer.seek_to_beginning(*resets)
                 else:
-                    consumer.seek_to_end(*resets)
+                    await consumer.seek_to_end(*resets)
                 empty_response()
-            except AssertionError:
-                self._illegal_state_fail(f"Trying to reset unassigned partitions to {direction}", content_type)
+            except (AssertionError, ValueError) as e:
+                self._illegal_state_fail(f"Trying to reset unassigned partitions to {direction}: {e}", content_type)
 
     async def fetch(self, internal_name: Tuple[str, str], content_type: str, formats: dict, query_params: dict):
         self.log.info("Running fetch for name %s with parameters %r and formats %r", internal_name, query_params, formats)
@@ -385,8 +383,7 @@ class ConsumerManager:
                     else config["consumer.request.timeout.ms"]
                 # we get to be more in line with the confluent proxy by doing a bunch of fetches each time and
                 # respecting the max fetch request size
-                max_bytes = int(query_params['max_bytes']) if "max_bytes" in query_params \
-                    else consumer.config["fetch_max_bytes"]
+                max_bytes = int(query_params['max_bytes']) if "max_bytes" in query_params else 52428800
             except ValueError:
                 KarapaceBase.internal_error(message=f"Invalid request parameters: {query_params}", content_type=content_type)
             for val in [timeout, max_bytes]:
@@ -410,15 +407,14 @@ class ConsumerManager:
                     "Polling with %r time left and %d bytes left, gathered %d messages so far", time_left, bytes_left,
                     message_count
                 )
-                data = consumer.poll(timeout_ms=timeout, max_records=1)
+                data = await consumer.getmany(timeout_ms=timeout, max_records=1)
                 self.log.debug("Successfully polled for messages")
                 for topic, records in data.items():
                     for rec in records:
                         message_count += 1
                         read_bytes += \
                             max(0, rec.serialized_key_size) + \
-                            max(0, rec.serialized_value_size) + \
-                            max(0, rec.serialized_header_size)
+                            max(0, rec.serialized_value_size)
                         poll_data[topic].append(rec)
             self.log.info("Gathered %d total messages", message_count)
             for tp in poll_data:
@@ -448,10 +444,10 @@ class ConsumerManager:
             return json.loads(bytes_.decode('utf-8'))
         return base64.b64encode(bytes_).decode('utf-8')
 
-    def close(self):
+    async def close(self):
         for k in list(self.consumers.keys()):
             c = self.consumers.pop(k)
             try:
-                c.consumer.close()
+                await c.consumer.stop()
             except:  # pylint: disable=bare-except
                 pass
