@@ -4,10 +4,12 @@ karapace - main
 Copyright (c) 2019 Aiven Ltd
 See LICENSE for details
 """
-
 from functools import partial
 from http import HTTPStatus
-from kafka import KafkaProducer
+from kafka import KafkaConsumer, KafkaProducer
+from kafka.admin import KafkaAdminClient
+from karapace import constants
+from karapace.config import Config
 from karapace.rapu import HTTPResponse, RestApp
 from karapace.utils import KarapaceKafkaClient
 from typing import NoReturn, Union
@@ -19,6 +21,66 @@ import time
 
 LOG_FORMAT_JOURNAL = "%(name)-20s\t%(threadName)s\t%(levelname)-8s\t%(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT_JOURNAL)
+
+
+def create_kafka_producer_from_config(config: Config) -> KafkaProducer:
+    return KafkaProducer(
+        bootstrap_servers=config["bootstrap_uri"],
+        security_protocol=config["security_protocol"],
+        ssl_cafile=config["ssl_cafile"],
+        ssl_certfile=config["ssl_certfile"],
+        ssl_keyfile=config["ssl_keyfile"],
+        sasl_mechanism=config["sasl_mechanism"],
+        sasl_plain_username=config["sasl_plain_username"],
+        sasl_plain_password=config["sasl_plain_password"],
+        api_version=(1, 0, 0),
+        metadata_max_age_ms=config["metadata_max_age_ms"],
+        max_block_ms=2000,  # missing topics will block unless we cache cluster metadata and pre-check
+        connections_max_idle_ms=config[
+            "connections_max_idle_ms"
+        ],  # helps through cluster upgrades ??
+        kafka_client=KarapaceKafkaClient,
+    )
+
+
+def create_kafka_consumer_from_config(config: Config) -> KafkaConsumer:
+    # Group not set on purpose, all consumers read the same data
+    session_timeout_ms = config["session_timeout_ms"]
+    request_timeout_ms = max(session_timeout_ms, KafkaConsumer.DEFAULT_CONFIG["request_timeout_ms"])
+    return KafkaConsumer(
+        config["topic_name"],
+        enable_auto_commit=False,
+        api_version=(1, 0, 0),
+        bootstrap_servers=config["bootstrap_uri"],
+        client_id=config["client_id"],
+        security_protocol=config["security_protocol"],
+        ssl_cafile=config["ssl_cafile"],
+        ssl_certfile=config["ssl_certfile"],
+        ssl_keyfile=config["ssl_keyfile"],
+        sasl_mechanism=config["sasl_mechanism"],
+        sasl_plain_username=config["sasl_plain_username"],
+        sasl_plain_password=config["sasl_plain_password"],
+        auto_offset_reset="earliest",
+        session_timeout_ms=session_timeout_ms,
+        request_timeout_ms=request_timeout_ms,
+        kafka_client=KarapaceKafkaClient,
+        metadata_max_age_ms=config["metadata_max_age_ms"],
+    )
+
+
+def create_kafka_admin_from_config(config: Config) -> KafkaAdminClient:
+    return KafkaAdminClient(
+        api_version_auto_timeout_ms=constants.API_VERSION_AUTO_TIMEOUT_MS,
+        bootstrap_servers=config["bootstrap_uri"],
+        client_id=config["client_id"],
+        security_protocol=config["security_protocol"],
+        ssl_cafile=config["ssl_cafile"],
+        ssl_certfile=config["ssl_certfile"],
+        ssl_keyfile=config["ssl_keyfile"],
+        sasl_mechanism=config["sasl_mechanism"],
+        sasl_plain_username=config["sasl_plain_username"],
+        sasl_plain_password=config["sasl_plain_password"],
+    )
 
 
 class KarapaceBase(RestApp):
@@ -43,26 +105,15 @@ class KarapaceBase(RestApp):
         self.log.info("Karapace initialized")
 
     def _create_producer(self) -> KafkaProducer:
-        while True:
+        producer = None
+        while producer is None:
             try:
-                return KafkaProducer(
-                    bootstrap_servers=self.config["bootstrap_uri"],
-                    security_protocol=self.config["security_protocol"],
-                    ssl_cafile=self.config["ssl_cafile"],
-                    ssl_certfile=self.config["ssl_certfile"],
-                    ssl_keyfile=self.config["ssl_keyfile"],
-                    sasl_mechanism=self.config["sasl_mechanism"],
-                    sasl_plain_username=self.config["sasl_plain_username"],
-                    sasl_plain_password=self.config["sasl_plain_password"],
-                    api_version=(1, 0, 0),
-                    metadata_max_age_ms=self.config["metadata_max_age_ms"],
-                    max_block_ms=2000,  # missing topics will block unless we cache cluster metadata and pre-check
-                    connections_max_idle_ms=self.config["connections_max_idle_ms"],  # helps through cluster upgrades ??
-                    kafka_client=KarapaceKafkaClient,
-                )
+                producer = create_kafka_producer_from_config(self.config)
             except:  # pylint: disable=bare-except
                 self.log.exception("Unable to create producer, retrying")
                 time.sleep(1)
+
+        return producer
 
     def close(self) -> None:
         if not self.producer:
@@ -71,7 +122,7 @@ class KarapaceBase(RestApp):
         self.producer = None
 
     @staticmethod
-    def r(body: Union[dict, list], content_type: str, status: HTTPStatus = HTTPStatus.OK) -> NoReturn:
+    def r(body: Union[dict, list, str], content_type: str, status: HTTPStatus = HTTPStatus.OK) -> NoReturn:
         raise HTTPResponse(
             body=body,
             status=status,
@@ -87,7 +138,7 @@ class KarapaceBase(RestApp):
             body={
                 "message": message,
                 "error_code": HTTPStatus.INTERNAL_SERVER_ERROR.value
-            }
+            },
         )
 
     @staticmethod
@@ -98,7 +149,7 @@ class KarapaceBase(RestApp):
             body={
                 "message": message,
                 "error_code": sub_code
-            }
+            },
         )
 
     @staticmethod
@@ -109,16 +160,18 @@ class KarapaceBase(RestApp):
             body={
                 "message": message,
                 "error_code": sub_code
-            }
+            },
         )
 
     @staticmethod
     def not_found(message: str, sub_code: int, content_type: str) -> NoReturn:
         KarapaceBase.r(
-            content_type=content_type, status=HTTPStatus.NOT_FOUND, body={
+            content_type=content_type,
+            status=HTTPStatus.NOT_FOUND,
+            body={
                 "message": message,
                 "error_code": sub_code
-            }
+            },
         )
 
     async def root_get(self) -> NoReturn:
