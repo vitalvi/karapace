@@ -27,10 +27,7 @@ def parse_avro_schema_definition(s: str) -> Schema:
 
         json_data = json.loads(s[:e.pos])
 
-    schema = SchemaFromJSONData(json_data, Names())
-
-    validate_schema_defaults(schema)
-    return schema
+    return SchemaFromJSONData(json_data, Names())
 
 
 class ValidateSchemaDefaultsException(Exception):

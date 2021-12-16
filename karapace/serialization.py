@@ -252,7 +252,7 @@ def unflatten_unions(schema: avro.schema.Schema, value: Any) -> Any:
 def read_value(schema: TypedSchema, bio: io.BytesIO):
     if schema.schema_type is SchemaType.AVRO:
         reader = DatumReader(schema.schema)
-        return unflatten_unions(schema.schema, reader.read(BinaryDecoder(bio)))
+        return reader.read(BinaryDecoder(bio))
     if schema.schema_type is SchemaType.JSONSCHEMA:
         value = load(bio)
         try:
@@ -266,7 +266,7 @@ def read_value(schema: TypedSchema, bio: io.BytesIO):
 def write_value(schema: TypedSchema, bio: io.BytesIO, value: dict):
     if schema.schema_type is SchemaType.AVRO:
         writer = DatumWriter(schema.schema)
-        writer.write(flatten_unions(schema.schema, value), BinaryEncoder(bio))
+        writer.write(value, BinaryEncoder(bio))
     elif schema.schema_type is SchemaType.JSONSCHEMA:
         try:
             schema.schema.validate(value)
