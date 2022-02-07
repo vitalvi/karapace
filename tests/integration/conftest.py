@@ -407,20 +407,18 @@ async def fixture_registry_async_tls(
 
     config_path = tmp_path / "karapace_config.json"
 
-    config = set_config_defaults(
-        {
-            "bootstrap_uri": kafka_servers.bootstrap_servers,
-            "server_tls_certfile": server_cert,
-            "server_tls_keyfile": server_key,
-            "port": 8444,
-            # Using the default settings instead of random values, otherwise it
-            # would not be possible to run the tests with external services.
-            # Because of this every test must be written in such a way that it can
-            # be executed twice with the same servers.
-            # "topic_name": new_random_name("topic"),
-            # "group_id": new_random_name("schema_registry")
-        }
-    )
+    config = set_config_defaults({
+        "bootstrap_uri": kafka_servers.bootstrap_servers,
+        "server_tls_certfile": server_cert,
+        "server_tls_keyfile": server_key,
+        "port": 8444,
+        # Using the default settings instead of random values, otherwise it
+        # would not be possible to run the tests with external services.
+        # Because of this every test must be written in such a way that it can
+        # be executed twice with the same servers.
+        # "topic_name": new_random_name("topic"),
+        # "group_id": new_random_name("schema_registry")
+    })
     write_config(config_path, config)
     registry = KarapaceSchemaRegistry(config=config)
     await registry.get_master()
