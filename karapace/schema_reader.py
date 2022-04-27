@@ -18,6 +18,7 @@ from threading import Event, Lock, Thread
 from typing import Any, Dict, Optional
 
 import logging
+import time
 import ujson
 
 Offset = int
@@ -34,6 +35,8 @@ LOG = logging.getLogger(__name__)
 
 KAFKA_CLIENT_CREATION_TIMEOUT_SECONDS = 2.0
 SCHEMA_TOPIC_CREATION_TIMEOUT_SECONDS = 5.0
+
+STATS_INTERVAL = 10
 
 
 def _create_consumer_from_config(config: Config) -> KafkaConsumer:
@@ -148,6 +151,8 @@ class KafkaSchemaReader(Thread):
         self.stats = StatsClient(
             sentry_config=config["sentry"],  # type: ignore[arg-type]
         )
+        self.next_stats_time = time.monotonic() + STATS_INTERVAL
+        self.stats_msg_count = 0
 
         # Thread synchronization objects
         # - offset is used by the REST API to wait until this thread has
@@ -251,6 +256,7 @@ class KafkaSchemaReader(Thread):
                 add_offsets = True
 
         for _, msgs in raw_msgs.items():
+            self.stats_msg_count += len(msgs)
             for msg in msgs:
                 try:
                     key = ujson.loads(msg.key.decode("utf8"))
@@ -270,6 +276,19 @@ class KafkaSchemaReader(Thread):
                 self.offset = msg.offset
                 if self.ready and add_offsets:
                     self.offset_watcher.offset_seen(self.offset)
+
+        self._send_statistics()
+
+
+    def _send_statistics(self):
+        if time.monotonic() >= self.next_stats_time:
+            self.next_stats_time = time.monotonic() + STATS_INTERVAL
+
+            self.stats.increase("karapace.schema_reader.messages", self.stats_msg_count)
+            self.stats_msg_count = 0
+            self.stats.gauge("karapace.schema_reader.schemas", len(self.schemas))
+            self.stats.gauge("karapace.schema_reader.subjects", len(self.subjects))
+
 
     def _handle_msg_config(self, key: dict, value: Optional[dict]) -> None:
         subject = key.get("subject")
