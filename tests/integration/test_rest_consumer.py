@@ -143,6 +143,12 @@ async def test_subscription(rest_async_client, admin_client, producer, trail):
     assert res.status_code == 409, f"Invalid state error expected: {res.status_code}"
     data = res.json()
     assert data["error_code"] == 40903, f"Invalid state error expected: {data}"
+    assert (
+        str(data)
+        == "{'error_code': 40903, 'message': 'IllegalStateError: You must choose only one way to configure your consumer:"
+        " (1) subscribe to specific topics by name, (2) subscribe to topics matching a regex pattern,"
+        " (3) assign itself specific topic-partitions.'}"
+    )
     # assign after subscribe will fail
     assign_path = f"/consumers/{group_name}/instances/{instance_id}/assignments{trail}"
     assign_payload = {"partitions": [{"topic": topic_name, "partition": 0}]}
